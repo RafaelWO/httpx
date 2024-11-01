@@ -2,11 +2,9 @@ from __future__ import annotations
 
 import codecs
 import email.message
-import ipaddress
 import os
 import re
 import typing
-from urllib.request import getproxies
 
 from ._types import PrimitiveData
 
@@ -95,87 +93,6 @@ def obfuscate_sensitive_headers(
         if to_str(k.lower()) in SENSITIVE_HEADERS:
             v = to_bytes_or_str("[secure]", match_type_of=v)
         yield k, v
-
-
-def port_or_default(url: URL) -> int | None:
-    if url.port is not None:
-        return url.port
-    return {"http": 80, "https": 443}.get(url.scheme)
-
-
-def same_origin(url: URL, other: URL) -> bool:
-    """
-    Return 'True' if the given URLs share the same origin.
-    """
-    return (
-        url.scheme == other.scheme
-        and url.host == other.host
-        and port_or_default(url) == port_or_default(other)
-    )
-
-
-def is_https_redirect(url: URL, location: URL) -> bool:
-    """
-    Return 'True' if 'location' is a HTTPS upgrade of 'url'
-    """
-    if url.host != location.host:
-        return False
-
-    return (
-        url.scheme == "http"
-        and port_or_default(url) == 80
-        and location.scheme == "https"
-        and port_or_default(location) == 443
-    )
-
-
-def get_environment_proxies() -> dict[str, str | None]:
-    """Gets proxy information from the environment"""
-
-    # urllib.request.getproxies() falls back on System
-    # Registry and Config for proxies on Windows and macOS.
-    # We don't want to propagate non-HTTP proxies into
-    # our configuration such as 'TRAVIS_APT_PROXY'.
-    proxy_info = getproxies()
-    mounts: dict[str, str | None] = {}
-
-    for scheme in ("http", "https", "all"):
-        if proxy_info.get(scheme):
-            hostname = proxy_info[scheme]
-            mounts[f"{scheme}://"] = (
-                hostname if "://" in hostname else f"http://{hostname}"
-            )
-
-    no_proxy_hosts = [host.strip() for host in proxy_info.get("no", "").split(",")]
-    for hostname in no_proxy_hosts:
-        # See https://curl.haxx.se/libcurl/c/CURLOPT_NOPROXY.html for details
-        # on how names in `NO_PROXY` are handled.
-        if hostname == "*":
-            # If NO_PROXY=* is used or if "*" occurs as any one of the comma
-            # separated hostnames, then we should just bypass any information
-            # from HTTP_PROXY, HTTPS_PROXY, ALL_PROXY, and always ignore
-            # proxies.
-            return {}
-        elif hostname:
-            # NO_PROXY=.google.com is marked as "all://*.google.com,
-            #   which disables "www.google.com" but not "google.com"
-            # NO_PROXY=google.com is marked as "all://*google.com,
-            #   which disables "www.google.com" and "google.com".
-            #   (But not "wwwgoogle.com")
-            # NO_PROXY can include domains, IPv6, IPv4 addresses and "localhost"
-            #   NO_PROXY=example.com,::1,localhost,192.168.0.0/16
-            if "://" in hostname:
-                mounts[hostname] = None
-            elif is_ipv4_hostname(hostname):
-                mounts[f"all://{hostname}"] = None
-            elif is_ipv6_hostname(hostname):
-                mounts[f"all://[{hostname}]"] = None
-            elif hostname.lower() == "localhost":
-                mounts[f"all://{hostname}"] = None
-            else:
-                mounts[f"all://*{hostname}"] = None
-
-    return mounts
 
 
 def to_bytes(value: str | bytes, encoding: str = "utf-8") -> bytes:
@@ -326,19 +243,3 @@ class URLPattern:
 
     def __eq__(self, other: typing.Any) -> bool:
         return isinstance(other, URLPattern) and self.pattern == other.pattern
-
-
-def is_ipv4_hostname(hostname: str) -> bool:
-    try:
-        ipaddress.IPv4Address(hostname.split("/")[0])
-    except Exception:
-        return False
-    return True
-
-
-def is_ipv6_hostname(hostname: str) -> bool:
-    try:
-        ipaddress.IPv6Address(hostname.split("/")[0])
-    except Exception:
-        return False
-    return True

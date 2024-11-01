@@ -1,7 +1,10 @@
+import os
+
 import httpcore
 import pytest
 
 import httpx
+from httpx._client import _get_environment_proxies
 
 
 def url_to_origin(url: str) -> httpcore.URL:
@@ -263,3 +266,29 @@ def test_proxy_with_mounts():
 
     transport = client._transport_for_url(httpx.URL("http://example.com"))
     assert transport == proxy_transport
+
+
+@pytest.mark.parametrize(
+    ["environment", "proxies"],
+    [
+        ({}, {}),
+        ({"HTTP_PROXY": "http://127.0.0.1"}, {"http://": "http://127.0.0.1"}),
+        (
+            {"https_proxy": "http://127.0.0.1", "HTTP_PROXY": "https://127.0.0.1"},
+            {"https://": "http://127.0.0.1", "http://": "https://127.0.0.1"},
+        ),
+        ({"all_proxy": "http://127.0.0.1"}, {"all://": "http://127.0.0.1"}),
+        ({"TRAVIS_APT_PROXY": "http://127.0.0.1"}, {}),
+        ({"no_proxy": "127.0.0.1"}, {"all://127.0.0.1": None}),
+        ({"no_proxy": "192.168.0.0/16"}, {"all://192.168.0.0/16": None}),
+        ({"no_proxy": "::1"}, {"all://[::1]": None}),
+        ({"no_proxy": "localhost"}, {"all://localhost": None}),
+        ({"no_proxy": "github.com"}, {"all://*github.com": None}),
+        ({"no_proxy": ".github.com"}, {"all://*.github.com": None}),
+        ({"no_proxy": "http://github.com"}, {"http://github.com": None}),
+    ],
+)
+def test_get_environment_proxies(environment, proxies):
+    os.environ.update(environment)
+
+    assert _get_environment_proxies() == proxies

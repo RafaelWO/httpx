@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import datetime
 import enum
+import ipaddress
 import logging
 import ssl
 import time
 import typing
+import urllib.request
 import warnings
 from contextlib import asynccontextmanager, contextmanager
 from types import TracebackType
@@ -46,12 +48,7 @@ from ._types import (
     TimeoutTypes,
 )
 from ._urls import URL, QueryParams
-from ._utils import (
-    URLPattern,
-    get_environment_proxies,
-    is_https_redirect,
-    same_origin,
-)
+from ._utils import URLPattern
 
 __all__ = ["USE_CLIENT_DEFAULT", "AsyncClient", "Client"]
 
@@ -59,6 +56,103 @@ __all__ = ["USE_CLIENT_DEFAULT", "AsyncClient", "Client"]
 # https://www.python.org/dev/peps/pep-0484/#annotating-instance-and-class-methods
 T = typing.TypeVar("T", bound="Client")
 U = typing.TypeVar("U", bound="AsyncClient")
+
+
+def _is_ipv4_hostname(hostname: str) -> bool:
+    try:
+        ipaddress.IPv4Address(hostname.split("/")[0])
+    except Exception:
+        return False
+    return True
+
+
+def _is_ipv6_hostname(hostname: str) -> bool:
+    try:
+        ipaddress.IPv6Address(hostname.split("/")[0])
+    except Exception:
+        return False
+    return True
+
+
+def _is_https_redirect(url: URL, location: URL) -> bool:
+    """
+    Return 'True' if 'location' is a HTTPS upgrade of 'url'
+    """
+    if url.host != location.host:
+        return False
+
+    return (
+        url.scheme == "http"
+        and _port_or_default(url) == 80
+        and location.scheme == "https"
+        and _port_or_default(location) == 443
+    )
+
+
+def _port_or_default(url: URL) -> int | None:
+    if url.port is not None:
+        return url.port
+    return {"http": 80, "https": 443}.get(url.scheme)
+
+
+def _same_origin(url: URL, other: URL) -> bool:
+    """
+    Return 'True' if the given URLs share the same origin.
+    """
+    return (
+        url.scheme == other.scheme
+        and url.host == other.host
+        and _port_or_default(url) == _port_or_default(other)
+    )
+
+
+def _get_environment_proxies() -> dict[str, str | None]:
+    """Gets proxy information from the environment"""
+
+    # urllib.request.getproxies() falls back on System
+    # Registry and Config for proxies on Windows and macOS.
+    # We don't want to propagate non-HTTP proxies into
+    # our configuration such as 'TRAVIS_APT_PROXY'.
+    proxy_info = urllib.request.getproxies()
+    mounts: dict[str, str | None] = {}
+
+    for scheme in ("http", "https", "all"):
+        if proxy_info.get(scheme):
+            hostname = proxy_info[scheme]
+            mounts[f"{scheme}://"] = (
+                hostname if "://" in hostname else f"http://{hostname}"
+            )
+
+    no_proxy_hosts = [host.strip() for host in proxy_info.get("no", "").split(",")]
+    for hostname in no_proxy_hosts:
+        # See https://curl.haxx.se/libcurl/c/CURLOPT_NOPROXY.html for details
+        # on how names in `NO_PROXY` are handled.
+        if hostname == "*":
+            # If NO_PROXY=* is used or if "*" occurs as any one of the comma
+            # separated hostnames, then we should just bypass any information
+            # from HTTP_PROXY, HTTPS_PROXY, ALL_PROXY, and always ignore
+            # proxies.
+            return {}
+        elif hostname:
+            # NO_PROXY=.google.com is marked as "all://*.google.com,
+            #   which disables "www.google.com" but not "google.com"
+            # NO_PROXY=google.com is marked as "all://*google.com,
+            #   which disables "www.google.com" and "google.com".
+            #   (But not "wwwgoogle.com")
+            # NO_PROXY can include domains, IPv6, IPv4 addresses and "localhost"
+            #   NO_PROXY=example.com,::1,localhost,192.168.0.0/16
+            if "://" in hostname:
+                mounts[hostname] = None
+            elif _is_ipv4_hostname(hostname):
+                mounts[f"all://{hostname}"] = None
+            elif _is_ipv6_hostname(hostname):
+                mounts[f"all://[{hostname}]"] = None
+            elif hostname.lower() == "localhost":
+                mounts[f"all://{hostname}"] = None
+            else:
+                mounts[f"all://*{hostname}"] = None
+
+    return mounts
 
 
 class UseClientDefault:
@@ -213,7 +307,7 @@ class BaseClient:
             if allow_env_proxies:
                 return {
                     key: None if url is None else Proxy(url=url)
-                    for key, url in get_environment_proxies().items()
+                    for key, url in _get_environment_proxies().items()
                 }
             return {}
         else:
@@ -519,8 +613,8 @@ class BaseClient:
         """
         headers = Headers(request.headers)
 
-        if not same_origin(url, request.url):
-            if not is_https_redirect(request.url, url):
+        if not _same_origin(url, request.url):
+            if not _is_https_redirect(request.url, url):
                 # Strip Authorization headers when responses are redirected
                 # away from the origin. (Except for direct HTTP to HTTPS redirects.)
                 headers.pop("Authorization", None)
